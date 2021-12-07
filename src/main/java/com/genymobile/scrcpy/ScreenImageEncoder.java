@@ -1,14 +1,13 @@
 package com.genymobile.scrcpy;
 
-import android.os.*;
-import com.genymobile.scrcpy.wrappers.SurfaceControl;
-
+import android.graphics.ImageFormat;
+import android.graphics.PixelFormat;
 import android.graphics.Rect;
-import android.media.MediaCodec;
-import android.media.MediaCodecInfo;
-import android.media.MediaCodecList;
-import android.media.MediaFormat;
+import android.media.*;
+import android.os.Build;
+import android.os.IBinder;
 import android.view.Surface;
+import com.genymobile.scrcpy.wrappers.SurfaceControl;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -18,7 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public abstract class ScreenEncoder implements Device.RotationListener {
+public class ScreenImageEncoder implements Device.RotationListener {
 
     private static final int DEFAULT_I_FRAME_INTERVAL = 10; // seconds
     private static final int REPEAT_FRAME_DELAY_US = 100_000; // repeat after 100ms
@@ -35,9 +34,8 @@ public abstract class ScreenEncoder implements Device.RotationListener {
     private int maxFps;
     private boolean sendFrameMeta;
     private long ptsOrigin;
-    protected Handler handler = new Handler(Looper.myLooper());
 
-    public ScreenEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName) {
+    public ScreenImageEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName) {
         this.sendFrameMeta = sendFrameMeta;
         this.bitRate = bitRate;
         this.maxFps = maxFps;
@@ -65,7 +63,102 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         internalStreamScreen(device, fd);
     }
 
-    protected abstract void internalStreamScreen(Device device, FileDescriptor fd) throws IOException;
+    private void internalStreamScreen(Device device, FileDescriptor fd) throws IOException {
+        MediaFormat format = createFormat(bitRate, maxFps, codecOptions);
+        device.setRotationListener(this);
+        boolean alive;
+
+        ScreenInfo screenInfo = device.getScreenInfo();
+        Rect videoRect = screenInfo.getVideoSize().toRect();
+        ImageReader reader = ImageReader.newInstance(videoRect.width(),videoRect.height(), ImageFormat.JPEG,1);
+        reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+            @Override
+            public void onImageAvailable(ImageReader reader) {
+                reader.acquireLatestImage();
+            }
+        }, null);
+        try {
+            do {
+                MediaCodec codec = createCodec(encoderName);
+                IBinder display = createDisplay();
+                ScreenInfo screenInfo = device.getScreenInfo();
+                Rect contentRect = screenInfo.getContentRect();
+                // include the locked video orientation
+                Rect videoRect = screenInfo.getVideoSize().toRect();
+                // does not include the locked video orientation
+                Rect unlockedVideoRect = screenInfo.getUnlockedVideoSize().toRect();
+                int videoRotation = screenInfo.getVideoRotation();
+                int layerStack = device.getLayerStack();
+
+                setSize(format, videoRect.width(), videoRect.height());
+                configure(codec, format);
+                Surface surface = codec.createInputSurface();
+                setDisplaySurface(display, surface, videoRotation, contentRect, unlockedVideoRect, layerStack);
+                codec.start();
+                try {
+                    alive = encode(codec, fd);
+                    // do not call stop() on exception, it would trigger an IllegalStateException
+                    codec.stop();
+                } finally {
+                    destroyDisplay(display);
+                    codec.release();
+                    surface.release();
+                }
+            } while (alive);
+        } finally {
+            device.setRotationListener(null);
+        }
+    }
+
+    private boolean encode(MediaCodec codec, FileDescriptor fd) throws IOException {
+        boolean eof = false;
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
+        while (!consumeRotationChange() && !eof) {
+            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, -1);
+            eof = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
+            try {
+                if (consumeRotationChange()) {
+                    // must restart encoding with new size
+                    break;
+                }
+                if (outputBufferId >= 0) {
+                    ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
+
+                    if (sendFrameMeta) {
+                        writeFrameMeta(fd, bufferInfo, codecBuffer.remaining());
+                    }
+
+                    IO.writeFully(fd, codecBuffer);
+                }
+            } finally {
+                if (outputBufferId >= 0) {
+                    codec.releaseOutputBuffer(outputBufferId, false);
+                }
+            }
+        }
+
+        return !eof;
+    }
+
+    private void writeFrameMeta(FileDescriptor fd, MediaCodec.BufferInfo bufferInfo, int packetSize) throws IOException {
+        headerBuffer.clear();
+
+        long pts;
+        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+            pts = NO_PTS; // non-media data packet
+        } else {
+            if (ptsOrigin == 0) {
+                ptsOrigin = bufferInfo.presentationTimeUs;
+            }
+            pts = bufferInfo.presentationTimeUs - ptsOrigin;
+        }
+
+        headerBuffer.putLong(pts);
+        headerBuffer.putInt(packetSize);
+        headerBuffer.flip();
+        IO.writeFully(fd, headerBuffer);
+    }
 
     private static MediaCodecInfo[] listEncoders() {
         List<MediaCodecInfo> result = new ArrayList<>();
@@ -136,12 +229,16 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         return format;
     }
 
-    protected static IBinder createDisplay() {
+    private static IBinder createDisplay() {
         // Since Android 12 (preview), secure displays could not be created with shell permissions anymore.
         // On Android 12 preview, SDK_INT is still R (not S), but CODENAME is "S".
         boolean secure = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || (Build.VERSION.SDK_INT == Build.VERSION_CODES.R && !"S"
                 .equals(Build.VERSION.CODENAME));
         return SurfaceControl.createDisplay("scrcpy", secure);
+    }
+
+    private static void configure(MediaCodec codec, MediaFormat format) {
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
     }
 
     private static void setSize(MediaFormat format, int width, int height) {
