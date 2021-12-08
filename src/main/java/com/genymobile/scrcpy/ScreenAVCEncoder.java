@@ -36,6 +36,10 @@ public class ScreenAVCEncoder extends ScreenEncoder {
     private boolean sendFrameMeta;
     private long ptsOrigin;
 
+    public ScreenAVCEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName) {
+        super(sendFrameMeta, bitRate, maxFps, codecOptions, encoderName);
+    }
+
     @Override
     public void onRotationChanged(int rotation) {
         rotationChanged.set(true);
@@ -187,32 +191,6 @@ public class ScreenAVCEncoder extends ScreenEncoder {
         Ln.d("Codec option set: " + key + " (" + value.getClass().getSimpleName() + ") = " + value);
     }
 
-    private static MediaFormat createFormat(int bitRate, int maxFps, List<CodecOption> codecOptions) {
-        MediaFormat format = new MediaFormat();
-        format.setString(MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_VIDEO_AVC);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
-        // must be present to configure the encoder, but does not impact the actual frame rate, which is variable
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, DEFAULT_I_FRAME_INTERVAL);
-        // display the very first frame, and recover from bad quality when no new frames
-        format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, REPEAT_FRAME_DELAY_US); // µs
-        if (maxFps > 0) {
-            // The key existed privately before Android 10:
-            // <https://android.googlesource.com/platform/frameworks/base/+/625f0aad9f7a259b6881006ad8710adce57d1384%5E%21/>
-            // <https://github.com/Genymobile/scrcpy/issues/488#issuecomment-567321437>
-            format.setFloat(KEY_MAX_FPS_TO_ENCODER, maxFps);
-        }
-
-        if (codecOptions != null) {
-            for (CodecOption option : codecOptions) {
-                setCodecOption(format, option);
-            }
-        }
-
-        return format;
-    }
-
     private static void configure(MediaCodec codec, MediaFormat format) {
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
     }
@@ -222,18 +200,4 @@ public class ScreenAVCEncoder extends ScreenEncoder {
         format.setInteger(MediaFormat.KEY_HEIGHT, height);
     }
 
-    private static void setDisplaySurface(IBinder display, Surface surface, int orientation, Rect deviceRect, Rect displayRect, int layerStack) {
-        SurfaceControl.openTransaction();
-        try {
-            SurfaceControl.setDisplaySurface(display, surface);
-            SurfaceControl.setDisplayProjection(display, orientation, deviceRect, displayRect);
-            SurfaceControl.setDisplayLayerStack(display, layerStack);
-        } finally {
-            SurfaceControl.closeTransaction();
-        }
-    }
-
-    private static void destroyDisplay(IBinder display) {
-        SurfaceControl.destroyDisplay(display);
-    }
 }

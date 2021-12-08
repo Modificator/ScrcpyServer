@@ -68,7 +68,7 @@ public final class Server {
         boolean tunnelForward = options.isTunnelForward();
 
         try (DesktopConnection connection = DesktopConnection.open(device, tunnelForward)) {
-            ScreenEncoder screenEncoder = new ScreenEncoder(options.getSendFrameMeta(), options.getBitRate(), options.getMaxFps(), codecOptions,
+            ScreenEncoder screenEncoder = new ScreenAVCEncoder(options.getSendFrameMeta(), options.getBitRate(), options.getMaxFps(), codecOptions,
                     options.getEncoderName());
 
             Thread controllerThread = null;

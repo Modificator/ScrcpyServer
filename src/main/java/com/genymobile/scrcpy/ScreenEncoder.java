@@ -35,7 +35,13 @@ public abstract class ScreenEncoder implements Device.RotationListener {
     private int maxFps;
     private boolean sendFrameMeta;
     private long ptsOrigin;
-    protected Handler handler = new Handler(Looper.myLooper());
+    protected Handler handler;
+
+    {
+        HandlerThread handlerThread = new HandlerThread("ScreenEncoder");
+        handlerThread.start();
+        handler = new Handler(handlerThread.getLooper());
+    }
 
     public ScreenEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName) {
         this.sendFrameMeta = sendFrameMeta;
@@ -110,7 +116,7 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         Ln.d("Codec option set: " + key + " (" + value.getClass().getSimpleName() + ") = " + value);
     }
 
-    private static MediaFormat createFormat(int bitRate, int maxFps, List<CodecOption> codecOptions) {
+    protected MediaFormat createFormat(int bitRate, int maxFps, List<CodecOption> codecOptions) {
         MediaFormat format = new MediaFormat();
         format.setString(MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_VIDEO_AVC);
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
@@ -136,7 +142,7 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         return format;
     }
 
-    protected static IBinder createDisplay() {
+    protected IBinder createDisplay() {
         // Since Android 12 (preview), secure displays could not be created with shell permissions anymore.
         // On Android 12 preview, SDK_INT is still R (not S), but CODENAME is "S".
         boolean secure = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || (Build.VERSION.SDK_INT == Build.VERSION_CODES.R && !"S"
@@ -149,7 +155,7 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         format.setInteger(MediaFormat.KEY_HEIGHT, height);
     }
 
-    private static void setDisplaySurface(IBinder display, Surface surface, int orientation, Rect deviceRect, Rect displayRect, int layerStack) {
+    protected void setDisplaySurface(IBinder display, Surface surface, int orientation, Rect deviceRect, Rect displayRect, int layerStack) {
         SurfaceControl.openTransaction();
         try {
             SurfaceControl.setDisplaySurface(display, surface);
@@ -160,7 +166,7 @@ public abstract class ScreenEncoder implements Device.RotationListener {
         }
     }
 
-    private static void destroyDisplay(IBinder display) {
+    protected void destroyDisplay(IBinder display) {
         SurfaceControl.destroyDisplay(display);
     }
 }

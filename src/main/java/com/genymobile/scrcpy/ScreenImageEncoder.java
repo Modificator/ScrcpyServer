@@ -1,5 +1,6 @@
 package com.genymobile.scrcpy;
 
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
@@ -9,6 +10,7 @@ import android.os.IBinder;
 import android.view.Surface;
 import com.genymobile.scrcpy.wrappers.SurfaceControl;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -17,7 +19,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class ScreenImageEncoder implements Device.RotationListener {
+public class ScreenImageEncoder extends ScreenEncoder {
 
     private static final int DEFAULT_I_FRAME_INTERVAL = 10; // seconds
     private static final int REPEAT_FRAME_DELAY_US = 100_000; // repeat after 100ms
@@ -36,20 +38,7 @@ public class ScreenImageEncoder implements Device.RotationListener {
     private long ptsOrigin;
 
     public ScreenImageEncoder(boolean sendFrameMeta, int bitRate, int maxFps, List<CodecOption> codecOptions, String encoderName) {
-        this.sendFrameMeta = sendFrameMeta;
-        this.bitRate = bitRate;
-        this.maxFps = maxFps;
-        this.codecOptions = codecOptions;
-        this.encoderName = encoderName;
-    }
-
-    @Override
-    public void onRotationChanged(int rotation) {
-        rotationChanged.set(true);
-    }
-
-    public boolean consumeRotationChange() {
-        return rotationChanged.getAndSet(false);
+        super(sendFrameMeta, bitRate, maxFps, codecOptions, encoderName);
     }
 
     public void streamScreen(Device device, FileDescriptor fd) throws IOException {
@@ -63,201 +52,57 @@ public class ScreenImageEncoder implements Device.RotationListener {
         internalStreamScreen(device, fd);
     }
 
-    private void internalStreamScreen(Device device, FileDescriptor fd) throws IOException {
-        MediaFormat format = createFormat(bitRate, maxFps, codecOptions);
+    @Override
+    public void internalStreamScreen(Device device, FileDescriptor fd) throws IOException {
         device.setRotationListener(this);
-        boolean alive;
-
-        ScreenInfo screenInfo = device.getScreenInfo();
-        Rect videoRect = screenInfo.getVideoSize().toRect();
-        ImageReader reader = ImageReader.newInstance(videoRect.width(),videoRect.height(), ImageFormat.JPEG,1);
-        reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
-            @Override
-            public void onImageAvailable(ImageReader reader) {
-                reader.acquireLatestImage();
-            }
-        }, null);
         try {
-            do {
-                MediaCodec codec = createCodec(encoderName);
-                IBinder display = createDisplay();
-                ScreenInfo screenInfo = device.getScreenInfo();
-                Rect contentRect = screenInfo.getContentRect();
-                // include the locked video orientation
-                Rect videoRect = screenInfo.getVideoSize().toRect();
-                // does not include the locked video orientation
-                Rect unlockedVideoRect = screenInfo.getUnlockedVideoSize().toRect();
-                int videoRotation = screenInfo.getVideoRotation();
-                int layerStack = device.getLayerStack();
+            IBinder display = createDisplay();
+            ScreenInfo screenInfo = device.getScreenInfo();
+            Rect contentRect = screenInfo.getContentRect();
+            // include the locked video orientation
+            Rect videoRect = screenInfo.getVideoSize().toRect();
+            // does not include the locked video orientation
+            Rect unlockedVideoRect = screenInfo.getUnlockedVideoSize().toRect();
+            int videoRotation = screenInfo.getVideoRotation();
+            int layerStack = device.getLayerStack();
+            ImageReader reader = ImageReader.newInstance(videoRect.width(), videoRect.height(), ImageFormat.JPEG, 1);
+            setDisplaySurface(display,reader.getSurface(),videoRotation,contentRect,unlockedVideoRect,layerStack);
+            reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                byte[] framePrefix = new byte[]{(byte) 0xFF, 0, (byte) 0xFF, 0, 0, (byte) 0xFF, 0, 0, 0, (byte) 0xFF, 0, 0, 0, 0, 0, (byte) 0xFF,};
 
-                setSize(format, videoRect.width(), videoRect.height());
-                configure(codec, format);
-                Surface surface = codec.createInputSurface();
-                setDisplaySurface(display, surface, videoRotation, contentRect, unlockedVideoRect, layerStack);
-                codec.start();
-                try {
-                    alive = encode(codec, fd);
-                    // do not call stop() on exception, it would trigger an IllegalStateException
-                    codec.stop();
-                } finally {
-                    destroyDisplay(display);
-                    codec.release();
-                    surface.release();
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    Image image = reader.acquireLatestImage();
+                    if (image == null) {
+                        return;
+                    }
+                    Image.Plane[] planes = image.getPlanes();
+                    if (planes != null && planes.length > 0) {
+                        ByteBuffer buffer = planes[0].getBuffer();
+                        int pixelStride = planes[0].getPixelStride();
+                        int rowStride = planes[0].getRowStride();
+                        int rowPadding = rowStride - pixelStride * image.getWidth();
+                        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                        Bitmap sourceBitmap = Bitmap.createBitmap(videoRect.width() + rowPadding / pixelStride, videoRect.height(),
+                                Bitmap.Config.ARGB_8888);
+                        sourceBitmap.copyPixelsFromBuffer(buffer);
+                        Bitmap cropBitmap = Bitmap.createBitmap(sourceBitmap, 0, 0, videoRect.width(), videoRect.height());
+                        cropBitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream);
+                        sourceBitmap.recycle();
+                        cropBitmap.recycle();
+                        //bitmap size + frame header + width + height
+                        ByteBuffer codecBuffer = ByteBuffer.allocate(outputStream.size()+framePrefix.length+16);
+                        codecBuffer.put(framePrefix);
+                        codecBuffer.putLong(cropBitmap.getWidth());
+                        codecBuffer.putLong(cropBitmap.getHeight());
+                        //bitmap copyPixelsToBuffer unsupport pos > 0
+                        codecBuffer.put(outputStream.toByteArray());
+                    }
                 }
-            } while (alive);
+            }, handler);
         } finally {
             device.setRotationListener(null);
         }
     }
 
-    private boolean encode(MediaCodec codec, FileDescriptor fd) throws IOException {
-        boolean eof = false;
-        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-
-        while (!consumeRotationChange() && !eof) {
-            int outputBufferId = codec.dequeueOutputBuffer(bufferInfo, -1);
-            eof = (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
-            try {
-                if (consumeRotationChange()) {
-                    // must restart encoding with new size
-                    break;
-                }
-                if (outputBufferId >= 0) {
-                    ByteBuffer codecBuffer = codec.getOutputBuffer(outputBufferId);
-
-                    if (sendFrameMeta) {
-                        writeFrameMeta(fd, bufferInfo, codecBuffer.remaining());
-                    }
-
-                    IO.writeFully(fd, codecBuffer);
-                }
-            } finally {
-                if (outputBufferId >= 0) {
-                    codec.releaseOutputBuffer(outputBufferId, false);
-                }
-            }
-        }
-
-        return !eof;
-    }
-
-    private void writeFrameMeta(FileDescriptor fd, MediaCodec.BufferInfo bufferInfo, int packetSize) throws IOException {
-        headerBuffer.clear();
-
-        long pts;
-        if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-            pts = NO_PTS; // non-media data packet
-        } else {
-            if (ptsOrigin == 0) {
-                ptsOrigin = bufferInfo.presentationTimeUs;
-            }
-            pts = bufferInfo.presentationTimeUs - ptsOrigin;
-        }
-
-        headerBuffer.putLong(pts);
-        headerBuffer.putInt(packetSize);
-        headerBuffer.flip();
-        IO.writeFully(fd, headerBuffer);
-    }
-
-    private static MediaCodecInfo[] listEncoders() {
-        List<MediaCodecInfo> result = new ArrayList<>();
-        MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
-        for (MediaCodecInfo codecInfo : list.getCodecInfos()) {
-            if (codecInfo.isEncoder() && Arrays.asList(codecInfo.getSupportedTypes()).contains(MediaFormat.MIMETYPE_VIDEO_AVC)) {
-                result.add(codecInfo);
-            }
-        }
-        return result.toArray(new MediaCodecInfo[result.size()]);
-    }
-
-    private static MediaCodec createCodec(String encoderName) throws IOException {
-        if (encoderName != null) {
-            Ln.d("Creating encoder by name: '" + encoderName + "'");
-            try {
-                return MediaCodec.createByCodecName(encoderName);
-            } catch (IllegalArgumentException e) {
-                MediaCodecInfo[] encoders = listEncoders();
-                throw new InvalidEncoderException(encoderName, encoders);
-            }
-        }
-        MediaCodec codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        Ln.d("Using encoder: '" + codec.getName() + "'");
-        return codec;
-    }
-
-    private static void setCodecOption(MediaFormat format, CodecOption codecOption) {
-        String key = codecOption.getKey();
-        Object value = codecOption.getValue();
-
-        if (value instanceof Integer) {
-            format.setInteger(key, (Integer) value);
-        } else if (value instanceof Long) {
-            format.setLong(key, (Long) value);
-        } else if (value instanceof Float) {
-            format.setFloat(key, (Float) value);
-        } else if (value instanceof String) {
-            format.setString(key, (String) value);
-        }
-
-        Ln.d("Codec option set: " + key + " (" + value.getClass().getSimpleName() + ") = " + value);
-    }
-
-    private static MediaFormat createFormat(int bitRate, int maxFps, List<CodecOption> codecOptions) {
-        MediaFormat format = new MediaFormat();
-        format.setString(MediaFormat.KEY_MIME, MediaFormat.MIMETYPE_VIDEO_AVC);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate);
-        // must be present to configure the encoder, but does not impact the actual frame rate, which is variable
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, DEFAULT_I_FRAME_INTERVAL);
-        // display the very first frame, and recover from bad quality when no new frames
-        format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, REPEAT_FRAME_DELAY_US); // µs
-        if (maxFps > 0) {
-            // The key existed privately before Android 10:
-            // <https://android.googlesource.com/platform/frameworks/base/+/625f0aad9f7a259b6881006ad8710adce57d1384%5E%21/>
-            // <https://github.com/Genymobile/scrcpy/issues/488#issuecomment-567321437>
-            format.setFloat(KEY_MAX_FPS_TO_ENCODER, maxFps);
-        }
-
-        if (codecOptions != null) {
-            for (CodecOption option : codecOptions) {
-                setCodecOption(format, option);
-            }
-        }
-
-        return format;
-    }
-
-    private static IBinder createDisplay() {
-        // Since Android 12 (preview), secure displays could not be created with shell permissions anymore.
-        // On Android 12 preview, SDK_INT is still R (not S), but CODENAME is "S".
-        boolean secure = Build.VERSION.SDK_INT < Build.VERSION_CODES.R || (Build.VERSION.SDK_INT == Build.VERSION_CODES.R && !"S"
-                .equals(Build.VERSION.CODENAME));
-        return SurfaceControl.createDisplay("scrcpy", secure);
-    }
-
-    private static void configure(MediaCodec codec, MediaFormat format) {
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-    }
-
-    private static void setSize(MediaFormat format, int width, int height) {
-        format.setInteger(MediaFormat.KEY_WIDTH, width);
-        format.setInteger(MediaFormat.KEY_HEIGHT, height);
-    }
-
-    private static void setDisplaySurface(IBinder display, Surface surface, int orientation, Rect deviceRect, Rect displayRect, int layerStack) {
-        SurfaceControl.openTransaction();
-        try {
-            SurfaceControl.setDisplaySurface(display, surface);
-            SurfaceControl.setDisplayProjection(display, orientation, deviceRect, displayRect);
-            SurfaceControl.setDisplayLayerStack(display, layerStack);
-        } finally {
-            SurfaceControl.closeTransaction();
-        }
-    }
-
-    private static void destroyDisplay(IBinder display) {
-        SurfaceControl.destroyDisplay(display);
-    }
 }
